@@ -1,255 +1,262 @@
-# THE ACTIONEERS - SAFE DIVE HACK 2025
-# Driver Distraction Alert System - Streamlit Version
+# =========================
+# Driver Distraction Detector (Streamlit)
+# =========================
+# Detects: Eyes-closed (drowsy), Yawning, Looking-away, Phone-use (+ bottle/cup)
+# Works on macOS/Windows/Linux. No external sound files needed.
+# Dependencies:
+#   pip install streamlit opencv-python mediapipe ultralytics
+# Place yolov8n.pt in the same directory (or give a full path below).
 
-# -------------------------------------
-# 1. IMPORT LIBRARIES
-# -------------------------------------
+import os
+import platform
+import time
+import tempfile
+
 import cv2
 import numpy as np
-import tensorflow as tf
+import streamlit as st
 import mediapipe as mp
-import pyttsx3
-import time
-import streamlit as st  # Import Streamlit
+from ultralytics import YOLO
 
-print("Libraries imported successfully.")
-print(f"OpenCV Version: {cv2.__version__}")
-print(f"TensorFlow Version: {tf.__version__}")
-print(f"Mediapipe Version: {mp.__version__}")
+# -----------------------------
+# 0) Streamlit CONFIG (MUST be first Streamlit call)
+# -----------------------------
+st.set_page_config(page_title="Driver Distraction Detection", layout="wide")
+st.title("Advanced Driver Assistance System")
 
-# -------------------------------------
-# 2. INITIALIZE MODELS AND UTILITIES
-# -------------------------------------
+# -----------------------------
+# 1) Cross-platform Beep (cooldown)
+# -----------------------------
+def play_beep():
+    sys = platform.system()
+    try:
+        if sys == "Windows":
+            import winsound
+            winsound.Beep(1200, 250)  # freq, ms
+        elif sys == "Darwin":  # macOS
+            # Play built-in system sound instead of speaking "beep"
+            os.system('afplay /System/Library/Sounds/Glass.aiff')
+        else:  # Linux
+            # Requires 'sox' for 'play' command. As a fallback, use console bell.
+            code = os.system('play -nq -t alsa synth 0.2 sine 1000 2>/dev/null')
+            if code != 0:
+                print("\a", end="")
+    except Exception:
+        print("\a", end="")
 
-# --- Mediapipe Initialization ---
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5,
-                                  min_tracking_confidence=0.5)
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7)
-mp_drawing = mp.solutions.drawing_utils
-drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
+# -----------------------------
+# 2) UI Controls
+# -----------------------------
+with st.sidebar:
+    st.header("Settings")
+    source = st.radio("Video source", ["Webcam", "Upload video"])
+    yolo_path = st.text_input("YOLOv8 model file", "yolov8n.pt")
 
-# --- Text-to-Speech (TTS) Engine Initialization ---
-try:
-    tts_engine = pyttsx3.init()
-    print("TTS Engine initialized.")
-except Exception as e:
-    print(f"Could not initialize TTS engine: {e}")
-    tts_engine = None
+    st.subheader("Thresholds")
+    EAR_THRESH = st.slider("Eyes Closed EAR threshold", 0.10, 0.35, 0.21, 0.005)
+    EAR_MIN_FRAMES = st.slider("Min frames: Eyes closed", 3, 60, 15, 1)
 
-# --- Load the Fine-Tuned TensorFlow/Keras Model ---
-# IMPORTANT: Replace 'path/to/your/distraction_model.h5' with the actual path to your trained model file.
-try:
-    # We are using a placeholder model. You should replace this with your actual model.
-    # model = tf.keras.models.load_model('path/to/your/distraction_model.h5')
-    # For demonstration purposes, we will simulate the model's output.
-    model = None
-    print("Model placeholder created. Replace with: tf.keras.models.load_model('your_model.h5')")
-except Exception as e:
-    print(f"Error loading model: {e}")
-    print("Please ensure the model path is correct and the file is not corrupted.")
-    model = None  # Set model to None if loading fails
+    MAR_THRESH = st.slider("Yawning MAR threshold", 0.30, 1.00, 0.60, 0.01)
+    MAR_MIN_FRAMES = st.slider("Min frames: Yawn", 1, 45, 8, 1)
 
-# -------------------------------------
-# 3. CONFIGURATION AND CONSTANTS
-# -------------------------------------
-# Labels should match the classes your model was trained on.
-CLASS_LABELS = [
-    'safe_driving',
-    'texting',
-    'talking_on_phone',
-    'drinking',
-    'reaching_behind',
-    'yawning'
-]
+    HEAD_YAW_FRAC = st.slider(
+        "Looking-away sensitivity (nose offset as % of face width)",
+        0.05, 0.60, 0.25, 0.01
+    )
+    HEAD_MIN_FRAMES = st.slider("Min frames: Looking away", 2, 60, 8, 1)
 
-# Frame dimensions for model input
-IMG_HEIGHT, IMG_WIDTH = 224, 224
+    st.subheader("YOLO Detection")
+    yolo_conf = st.slider("YOLO confidence", 0.10, 0.90, 0.50, 0.05)
+    detect_phone = st.checkbox("Detect phone", True)
+    detect_drink = st.checkbox("Detect drinking (bottle/cup)", True)
 
-# Alerting configuration
-ALERT_COOLDOWN_SECONDS = 3
-last_alert_time = 0
-current_alert_message = ""
+    st.subheader("Alert")
+    enable_sound = st.checkbox("Enable beep", True)
+    BEEP_COOLDOWN = st.slider("Beep cooldown (seconds)", 0.2, 5.0, 1.5, 0.1)
 
+    start = st.checkbox("Start detection")
 
-# -------------------------------------
-# 4. HELPER FUNCTIONS
-# -------------------------------------
-
-def speak_alert(message):
-    """Triggers a text-to-speech alert if the cooldown has passed."""
-    global last_alert_time
-    current_time = time.time()
-    if (current_time - last_alert_time) > ALERT_COOLDOWN_SECONDS:
-        if tts_engine:
-            try:
-                tts_engine.stop()
-                tts_engine.say(message)
-                tts_engine.runAndWait()
-                last_alert_time = current_time
-            except Exception as e:
-                print(f"TTS Error: {e}")
-        else:
-            print(f"AUDIO ALERT: {message}")
-        last_alert_time = current_time
-
-
-def calculate_mouth_aspect_ratio(face_landmarks, frame_shape):
-    """Calculates the Mouth Aspect Ratio (MAR) to detect yawning."""
-    mouth_top_idx = 13
-    mouth_bottom_idx = 14
-    mouth_left_idx = 78
-    mouth_right_idx = 308
-
-    h, w = frame_shape
-    mouth_top = (int(face_landmarks.landmark[mouth_top_idx].x * w), int(face_landmarks.landmark[mouth_top_idx].y * h))
-    mouth_bottom = (int(face_landmarks.landmark[mouth_bottom_idx].x * w),
-                    int(face_landmarks.landmark[mouth_bottom_idx].y * h))
-    mouth_left = (int(face_landmarks.landmark[mouth_left_idx].x * w),
-                  int(face_landmarks.landmark[mouth_left_idx].y * h))
-    mouth_right = (int(face_landmarks.landmark[mouth_right_idx].x * w),
-                   int(face_landmarks.landmark[mouth_right_idx].y * h))
-
-    vertical_dist = np.linalg.norm(np.array(mouth_top) - np.array(mouth_bottom))
-    horizontal_dist = np.linalg.norm(np.array(mouth_left) - np.array(mouth_right))
-
-    if horizontal_dist == 0:
-        return 0
-
-    mar = vertical_dist / horizontal_dist
-    return mar
-
-
-def is_hand_near_face(hand_landmarks, face_landmarks, frame_shape):
-    """Checks if a hand is close to the face region."""
-    if not hand_landmarks or not face_landmarks:
-        return False
-
-    h, w = frame_shape
-
-    face_x = [lm.x * w for lm in face_landmarks.landmark]
-    face_y = [lm.y * h for lm in face_landmarks.landmark]
-    face_min_x, face_max_x = min(face_x), max(face_x)
-    face_min_y, face_max_y = min(face_y), max(face_y)
-
-    for hand_lm in hand_landmarks:
-        for lm in hand_lm.landmark:
-            hand_x, hand_y = int(lm.x * w), int(lm.y * h)
-            if (face_min_x < hand_x < face_max_x) and (face_min_y < hand_y < face_max_y):
-                return True
-    return False
-
-
-# -------------------------------------
-# 5. STREAMLIT APP LAYOUT
-# -------------------------------------
-st.set_page_config(page_title="Safe Dive - Driver Distraction Alert", layout="wide")
-st.title("Safe Dive - Driver Distraction Alert System")
-st.info("This application uses your webcam to monitor driver behavior and alert for distractions.")
-
-run = st.checkbox('Run Webcam')
-FRAME_WINDOW = st.image([])
-
-# -------------------------------------
-# 6. MAIN VIDEO PROCESSING LOOP
-# -------------------------------------
-cap = cv2.VideoCapture(0)
-
-if not cap.isOpened():
-    st.error("Error: Could not open video source. Please check camera permissions.")
+# -----------------------------
+# 3) Prepare Video Source
+# -----------------------------
+video_path = None
+if source == "Upload video":
+    uploaded_file = st.file_uploader("Upload video", type=["mp4", "avi", "mov", "mkv"])
+    if uploaded_file:
+        tfile = tempfile.NamedTemporaryFile(delete=False)
+        tfile.write(uploaded_file.read())
+        video_path = tfile.name
 else:
-    st.success("Video source opened successfully.")
+    video_path = 0  # webcam
 
-while run:
-    success, frame = cap.read()
-    if not success:
-        st.error("Failed to capture frame from webcam. Please restart.")
-        break
+# -----------------------------
+# 4) Load YOLO (optional but recommended)
+# -----------------------------
+yolo_model = None
+yolo_loaded_ok = False
+yolo_warnings = []
+if os.path.exists(yolo_path):
+    try:
+        yolo_model = YOLO(yolo_path)
+        yolo_loaded_ok = True
+    except Exception as e:
+        yolo_warnings.append(f"YOLO load failed: {e}")
+else:
+    yolo_warnings.append(f"Model file not found: {yolo_path}")
 
-    frame = cv2.flip(frame, 1)
-    display_frame = frame.copy()
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+if yolo_warnings:
+    st.warning(" | ".join(yolo_warnings))
 
-    # --- Model Prediction ---
-    distraction_label = "safe_driving"
-    if model:
-        model_frame = cv2.resize(rgb_frame, (IMG_HEIGHT, IMG_WIDTH))
-        model_frame = np.expand_dims(model_frame, axis=0)
-        model_frame = model_frame / 255.0
+# -----------------------------
+# 5) Mediapipe Setup
+# -----------------------------
+mp_face_mesh = mp.solutions.face_mesh
 
-        predictions = model.predict(model_frame)
-        predicted_index = np.argmax(predictions[0])
-        confidence = np.max(predictions[0])
+# Indices for EAR/MAR using MediaPipe FaceMesh (468 landmarks)
+LEFT_EYE = [33, 160, 158, 133, 153, 144]   # [p1, p2, p3, p6, p5, p4]
+RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+MOUTH_VERT_TOP = 13
+MOUTH_VERT_BOTTOM = 14
+MOUTH_HORZ_LEFT = 78
+MOUTH_HORZ_RIGHT = 308
 
-        if confidence > 0.6:
-            distraction_label = CLASS_LABELS[predicted_index]
+def ear_from_landmarks(lms, ids):
+    p1 = np.array([lms[ids[0]].x, lms[ids[0]].y])
+    p2 = np.array([lms[ids[1]].x, lms[ids[1]].y])
+    p3 = np.array([lms[ids[2]].x, lms[ids[2]].y])
+    p4 = np.array([lms[ids[5]].x, lms[ids[5]].y])
+    p5 = np.array([lms[ids[4]].x, lms[ids[4]].y])
+    p6 = np.array([lms[ids[3]].x, lms[ids[3]].y])
+    v = np.linalg.norm(p2 - p4) + np.linalg.norm(p3 - p5)
+    h = np.linalg.norm(p1 - p6) + 1e-6
+    return v / (2.0 * h)
 
-    # --- Mediapipe Processing ---
-    face_results = face_mesh.process(rgb_frame)
-    hand_results = hands.process(rgb_frame)
+def mar_from_landmarks(lms):
+    top = np.array([lms[MOUTH_VERT_TOP].x, lms[MOUTH_VERT_TOP].y])
+    bot = np.array([lms[MOUTH_VERT_BOTTOM].x, lms[MOUTH_VERT_BOTTOM].y])
+    left = np.array([lms[MOUTH_HORZ_LEFT].x, lms[MOUTH_HORZ_LEFT].y])
+    right = np.array([lms[MOUTH_HORZ_RIGHT].x, lms[MOUTH_HORZ_RIGHT].y])
+    v = np.linalg.norm(top - bot)
+    h = np.linalg.norm(left - right) + 1e-6
+    return v / h
 
-    # --- Analysis and Alert Logic ---
-    is_distracted = False
-    alert_text = ""
+def head_yaw_fraction(lms, img_w):
+    nose_idx = 1
+    left_eye_idx = 33
+    right_eye_idx = 263
+    nose_x = lms[nose_idx].x * img_w
+    left_x = lms[left_eye_idx].x * img_w
+    right_x = lms[right_eye_idx].x * img_w
+    mid_x = 0.5 * (left_x + right_x)
+    face_width = abs(right_x - left_x) + 1e-6
+    return abs(nose_x - mid_x) / face_width
 
-    if face_results.multi_face_landmarks:
-        for face_landmarks in face_results.multi_face_landmarks:
-            mar = calculate_mouth_aspect_ratio(face_landmarks, frame.shape[:2])
-            if mar > 0.6:
-                alert_text = "ALERT: Yawning Detected"
-                is_distracted = True
-                speak_alert("Driver may be drowsy.")
+# -----------------------------
+# 6) Display holders
+# -----------------------------
+frame_area = st.empty()
+status_area = st.empty()
+hint_area = st.empty()
 
-    if not is_distracted and hand_results.multi_hand_landmarks and face_results.multi_face_landmarks:
-        if is_hand_near_face(hand_results.multi_hand_landmarks, face_results.multi_face_landmarks[0], frame.shape[:2]):
-            if distraction_label in ['texting', 'talking_on_phone']:
-                alert_text = f"ALERT: {distraction_label.replace('_', ' ').title()}"
+# -----------------------------
+# 7) Detection loop
+# -----------------------------
+if start and video_path is not None:
+    cap = cv2.VideoCapture(video_path)
+
+    eyes_closed_frames = 0
+    yawn_frames = 0
+    away_frames = 0
+    last_beep_time = 0.0
+
+    with mp_face_mesh.FaceMesh(
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    ) as face_mesh:
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            face_results = face_mesh.process(rgb)
+            active_alerts = []
+
+            if face_results.multi_face_landmarks:
+                lms = face_results.multi_face_landmarks[0].landmark
+                xs = np.array([lm.x for lm in lms]); ys = np.array([lm.y for lm in lms])
+                x1 = int(xs.min() * w); y1 = int(ys.min() * h)
+                x2 = int(xs.max() * w); y2 = int(ys.max() * h)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 200, 80), 2)
+
+                left_ear = ear_from_landmarks(lms, LEFT_EYE)
+                right_ear = ear_from_landmarks(lms, RIGHT_EYE)
+                ear = 0.5 * (left_ear + right_ear)
+                if ear < EAR_THRESH: eyes_closed_frames += 1
+                else: eyes_closed_frames = 0
+                if eyes_closed_frames >= EAR_MIN_FRAMES:
+                    active_alerts.append("😴 Eyes Closed (Drowsy)")
+
+                mar = mar_from_landmarks(lms)
+                if mar > MAR_THRESH: yawn_frames += 1
+                else: yawn_frames = 0
+                if yawn_frames >= MAR_MIN_FRAMES:
+                    active_alerts.append("😮 Yawning")
+
+                yaw_frac = head_yaw_fraction(lms, w)
+                if yaw_frac > HEAD_YAW_FRAC: away_frames += 1
+                else: away_frames = 0
+                if away_frames >= HEAD_MIN_FRAMES:
+                    active_alerts.append("↔️ Looking Away")
+
+                cv2.putText(frame, f"EAR:{ear:.2f}  MAR:{mar:.2f}  Yaw:{yaw_frac:.2f}",
+                            (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
             else:
-                alert_text = "ALERT: Hand near face"
-            is_distracted = True
-            speak_alert("Potential phone usage detected.")
+                away_frames += 1
+                if away_frames >= HEAD_MIN_FRAMES:
+                    active_alerts.append("🟡 Face Not Visible")
 
-    if not is_distracted and distraction_label != 'safe_driving':
-        alert_text = f"ALERT: {distraction_label.replace('_', ' ').title()}"
-        is_distracted = True
-        speak_alert("Distraction detected.")
+            if yolo_loaded_ok and (detect_phone or detect_drink):
+                try:
+                    yout = yolo_model.predict(frame, conf=yolo_conf, imgsz=416, verbose=False)
+                    for r in yout:
+                        for box in r.boxes:
+                            cls = int(box.cls[0])
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            if detect_phone and cls == 67:
+                                active_alerts.append("📱 Phone Detected")
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                                cv2.putText(frame, "Phone", (x1, y1 - 6),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                            if detect_drink and cls in (39, 41):
+                                active_alerts.append("🥤 Drinking Detected")
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 160, 0), 2)
+                                cv2.putText(frame, "Drink", (x1, y1 - 6),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 160, 0), 2)
+                except Exception as e:
+                    cv2.putText(frame, f"YOLO error: {e}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
-    # --- Display Information on Frame ---
-    if is_distracted:
-        status_text = f"STATUS: DISTRACTED ({alert_text})"
-        status_color = (0, 0, 255)  # Red
-    else:
-        status_text = "STATUS: SAFE DRIVING"
-        status_color = (0, 255, 0)  # Green
+            if active_alerts:
+                msg = " | ".join(sorted(set(active_alerts)))
+                status_area.error(f"🚨 {msg}")
+                now = time.time()
+                if enable_sound and (now - last_beep_time) >= BEEP_COOLDOWN:
+                    play_beep()
+                    last_beep_time = now
+            else:
+                status_area.success("✅ Focused on driving")
 
-    cv2.rectangle(display_frame, (0, 0), (display_frame.shape[1], 40), (0, 0, 0), -1)
-    cv2.putText(display_frame, status_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+            frame_area.image(frame, channels="BGR")
 
-    if face_results.multi_face_landmarks:
-        for face_landmarks in face_results.multi_face_landmarks:
-            mp_drawing.draw_landmarks(
-                image=display_frame,
-                landmark_list=face_landmarks,
-                connections=mp_face_mesh.FACEMESH_TESSELATION,
-                landmark_drawing_spec=drawing_spec,
-                connection_drawing_spec=drawing_spec)
-    if hand_results.multi_hand_landmarks:
-        for hand_landmarks in hand_results.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(
-                image=display_frame,
-                landmark_list=hand_landmarks,
-                connections=mp_hands.HAND_CONNECTIONS)
+            if not st.session_state.get("keep_running", True) and source == "Webcam":
+                break
 
-    # --- Show the final frame in Streamlit ---
-    # Use BGR channel order as display_frame is from OpenCV
-    FRAME_WINDOW.image(display_frame, channels="BGR")
-
-# -------------------------------------
-# 7. CLEANUP
-# -------------------------------------
-cap.release()
-if tts_engine:
-    tts_engine.stop()
-st.write("Webcam stopped.")
-print("Resources released. Program finished.")
+    cap.release()
+else:
+    hint_area.info("✅ Set options in the sidebar and tick **Start detection** to begin.")
